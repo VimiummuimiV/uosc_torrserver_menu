@@ -376,6 +376,8 @@ local function back_item(target)
     return {title = "Back", icon = "arrow_back", value = target or "back", keep_open = true}
 end
 
+local episode_progress_label
+
 local function stop_resume_action(hash)
     if hash and playing.hash and hash:lower() == playing.hash then
         return {name = "drop", icon = "stop", label = "Stop streaming"}
@@ -385,14 +387,16 @@ end
 
 local function history_actions(entry)
     local actions = {stop_resume_action(entry.hash)}
+    if episode_progress_label(entry.items, entry.hash) then
+        actions[#actions + 1] = {name = "previous_episode", icon = "skip_previous", label = "Previous episode"}
+        actions[#actions + 1] = {name = "next_episode", icon = "skip_next", label = "Next episode"}
+    end
     if entry.source then
         actions[#actions + 1] = {name = "open_source", icon = "open_in_new", label = "Open source"}
     end
     actions[#actions + 1] = {name = "delete", icon = "delete", label = "Remove from history"}
     return actions
 end
-
-local episode_progress_label
 
 local function root_menu()
     local items = {
@@ -563,17 +567,30 @@ local function play_queued(value, items)
     return load_queue(queue)
 end
 
-local function play_picked(items)
+-- Custom playlist if one was built, otherwise video files with skips removed.
+local function episode_order(items)
     local hash = items_hash(items)
+    local videos = video_items(items)
     local picks = hash and episode_picks[hash]
-    if not picks or #picks == 0 then return false end
-    local by_url = {}
-    for _, item in ipairs(video_items(items)) do by_url[item_url(item.value)] = item end
-    local queue = {}
-    for _, url in ipairs(picks) do
-        if by_url[url] then queue[#queue + 1] = by_url[url] end
+    if picks and #picks > 0 then
+        local by_url = {}
+        for _, item in ipairs(videos) do by_url[item_url(item.value)] = item end
+        local ordered = {}
+        for _, url in ipairs(picks) do
+            if by_url[url] then ordered[#ordered + 1] = by_url[url] end
+        end
+        if #ordered > 0 then return ordered end
     end
-    return load_queue(queue)
+    local skipped = hash and episode_skips[hash] or {}
+    local ordered = {}
+    for _, item in ipairs(videos) do
+        if not skipped[item_url(item.value)] then ordered[#ordered + 1] = item end
+    end
+    return ordered
+end
+
+local function play_picked(items)
+    return load_queue(episode_order(items))
 end
 
 local function toggle_episode_skip(value)
@@ -1421,6 +1438,48 @@ local function play_history_entry(hash)
     end
 end
 
+local function order_index(order, url)
+    for index, item in ipairs(order) do
+        if item_url(item.value) == url then return index end
+    end
+end
+
+-- Previous/next follow episode_order. A manually played skipped file still
+-- steps to the nearest kept episode on either side.
+local function play_adjacent(hash, step)
+    local entry = find_history(hash)
+    if not entry then
+        show_error("history entry no longer available")
+        return
+    end
+    if not start_torrserver() then return end
+    local order = episode_order(entry.items)
+    if #order == 0 then
+        show_error("no episodes")
+        return
+    end
+    local current_url = playing.hash == hash:lower() and mp.get_property("path") or nil
+    local current_index = current_url and order_index(order, current_url)
+    if current_url and not current_index then
+        local file_index = order_index(video_items(entry.items), current_url)
+        if file_index then
+            for index, item in ipairs(order) do
+                local kept = order_index(video_items(entry.items), item_url(item.value))
+                if step < 0 and kept < file_index then current_index = index + 1 end
+                if step > 0 and kept > file_index then current_index = index - 1 break end
+            end
+        end
+    end
+    local target = current_index and (current_index + step) or (step > 0 and 1 or nil)
+    if not target or target < 1 or target > #order then
+        mp.osd_message(step > 0 and "No next episode" or "No previous episode", 2)
+        return
+    end
+    local queue = {}
+    for index = target, #order do queue[#queue + 1] = order[index] end
+    if not load_queue(queue) then show_error("failed to start playback") end
+end
+
 local function add_torrent_from_file(filepath)
     filepath = trim(filepath)
     if filepath == "" then
@@ -1600,6 +1659,14 @@ mp.register_script_message("torrserver-menu-event", function(json)
             send_menu("update-menu", root_menu())
             return
         end
+    end
+    if event.action == "previous_episode" or event.action == "next_episode" then
+        local hash = history_hash(event.value)
+        if hash then
+            play_adjacent(hash, event.action == "next_episode" and 1 or -1)
+            send_menu("update-menu", root_menu())
+        end
+        return
     end
     if event.action == "clear_filter" then
         clear_filters(true) -- Stay in search menu
