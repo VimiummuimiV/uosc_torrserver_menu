@@ -68,24 +68,43 @@ local opts = {
     -- menu title truncation
     elide_titles = true,
     title_max_chars = 60,
+    -- multi-file torrents: queue later video files after the one that was clicked
+    queue_episodes = true,
+    -- advance to the next queued file when the current one ends; no pauses instead
+    playlist_autoplay = true,
+    -- count | position | remaining. See torrserver.conf.
+    episode_progress = "position",
+    -- comma-separated extensions treated as episodes; everything else stays a single-file open
+    video_extensions = "mkv,mp4,m4v,mov,avi,wmv,asf,webm,flv,f4v,mpg,mpeg,mpe,m2v,ts,m2ts,mts,m2t,vob,ogv,ogm,divx,3gp,3g2,rm,rmvb,qt,mk3d",
 }
 options.read_options(opts, "torrserver")
+if opts.episode_progress ~= "position" and opts.episode_progress ~= "remaining" then
+    opts.episode_progress = "count"
+end
 
 -- torrserver.conf keys stay flat above (mp.options can't bind nested
 -- tables), grouped here once into the shape the rest of the script uses.
 local metadata = {retries = opts.metadata_retries, delay = opts.metadata_retry_delay}
 local search = {timeout = opts.search_timeout, retries = opts.search_retries, delay = opts.search_retry_delay}
 
-local search_servers = {}
-for token in (opts.search_server or ""):gmatch("[^,]+") do
-    local s = token:match("^%s*(.-)%s*$")
-    if s and s ~= "" then search_servers[#search_servers + 1] = s end
+local function split_csv(value)
+    local parts = {}
+    for token in (value or ""):gmatch("[^,]+") do
+        local part = token:match("^%s*(.-)%s*$")
+        if part ~= "" then parts[#parts + 1] = part end
+    end
+    return parts
+end
+
+local search_servers = split_csv(opts.search_server)
+local video_extensions = {}
+for _, extension in ipairs(split_csv(opts.video_extensions)) do
+    video_extensions[extension:lower()] = true
 end
 
 local size_filters = {}
-for token in (opts.size_filters or ""):gmatch("[^,]+") do
-    local s = token:match("^%s*(.-)%s*$")
-    local min_s, max_s = s:match("^(%d*)%-(%d*)$")
+for _, token in ipairs(split_csv(opts.size_filters)) do
+    local min_s, max_s = token:match("^(%d*)%-(%d*)$")
     if min_s and min_s ~= "" then
         local min_gb, max_gb = tonumber(min_s), tonumber(max_s)
         local label
@@ -147,6 +166,10 @@ local last_opened_magnet = nil
 local pending_entry = nil
 local files_back = nil -- "back" | "back_search" while in files menu
 local files_items = nil -- items currently shown in the files menu
+-- Per-torrent session marks. Skips drop files from the default "queue the rest"
+-- path. Picks are an explicit playlist in the order the user added them.
+local episode_skips = {}
+local episode_picks = {}
 local metadata_poll = nil -- poll handle while torrserver.poll_metadata_async is in flight
 
 --- paths / cache -------------------------------------------------------
@@ -332,8 +355,8 @@ local function close_menu()
     send_menu("close-menu", {type = menu_type})
 end
 
-local function menu_data(title, items)
-    return {
+local function menu_data(title, items, footnote)
+    local data = {
         type = menu_type,
         id = menu_type,
         title = title,
@@ -345,6 +368,8 @@ local function menu_data(title, items)
         on_close = "callback",
         callback = {script_name, "torrserver-menu-event"},
     }
+    if footnote then data.footnote = footnote end
+    return data
 end
 
 local function back_item(target)
@@ -366,6 +391,8 @@ local function history_actions(entry)
     actions[#actions + 1] = {name = "delete", icon = "delete", label = "Remove from history"}
     return actions
 end
+
+local episode_progress_label
 
 local function root_menu()
     local items = {
@@ -402,10 +429,14 @@ local function root_menu()
     end
     for i, entry in ipairs(history) do
         local is_playing = playing.hash and entry.hash and entry.hash:lower() == playing.hash
+        local hint_parts = {}
+        local progress = episode_progress_label(entry.items, entry.hash)
+        if progress then hint_parts[#hint_parts + 1] = progress end
+        if stats[entry.hash] then hint_parts[#hint_parts + 1] = stats[entry.hash] end
         items[#items + 1] = {
             title = elide(entry.title, opts.title_max_chars),
-            hint = stats[entry.hash],
-            icon = is_playing and "play_arrow" or "movie",
+            hint = #hint_parts > 0 and table.concat(hint_parts, " · ") or nil,
+            icon = is_playing and "play_arrow" or (progress and "folder" or "movie"),
             value = "history:" .. entry.hash,
             keep_open = true,
             actions = history_actions(entry),
@@ -424,15 +455,156 @@ local function root_menu()
     return menu_data("Add torrent", items)
 end
 
+local function is_video_file(title)
+    local extension = title and title:match("%.([%w]+)$")
+    return extension and video_extensions[extension:lower()] or false
+end
+
+local function stream_hash(url)
+    local hash = type(url) == "string" and url:match("[?&]link=([^&]+)")
+    return hash and hash:lower() or nil
+end
+
+local function item_url(value)
+    return type(value) == "table" and value[2] or nil
+end
+
+local function items_hash(items)
+    for _, item in ipairs(items or {}) do
+        local hash = stream_hash(item_url(item.value))
+        if hash then return hash end
+    end
+end
+
+local function video_items(items)
+    local videos = {}
+    for _, item in ipairs(items or {}) do
+        if is_video_file(item.title) and item_url(item.value) then
+            videos[#videos + 1] = item
+        end
+    end
+    return videos
+end
+
+local function pick_index(hash, url)
+    for index, picked in ipairs(episode_picks[hash] or {}) do
+        if picked == url then return index end
+    end
+end
+
+-- current/total while this torrent is playing. A loaded multi-file playlist
+-- is the denominator; otherwise the episode index in the torrent file list.
+local function playing_fraction(videos, hash)
+    local total = #videos
+    if total < 2 or not hash or playing.hash ~= hash then return nil, total end
+    local count = mp.get_property_number("playlist-count") or 0
+    local position = mp.get_property_number("playlist-pos") or -1
+    local matched, current = 0, nil
+    for index = 0, count - 1 do
+        local filename = mp.get_property("playlist/" .. index .. "/filename") or ""
+        if stream_hash(filename) == hash then
+            matched = matched + 1
+            if index == position then current = matched end
+        end
+    end
+    if matched > 1 and current then return current, matched end
+    local playing_url = mp.get_property("path")
+    for index, item in ipairs(videos) do
+        if item_url(item.value) == playing_url then return index, total end
+    end
+    return nil, total
+end
+
+function episode_progress_label(items, hash)
+    local videos = video_items(items)
+    if #videos < 2 then return nil end
+    local current, shown_total = playing_fraction(videos, hash and hash:lower())
+    if not current or opts.episode_progress == "count" then
+        return #videos .. " episodes"
+    end
+    if opts.episode_progress == "remaining" then
+        return (shown_total - current + 1) .. "/" .. shown_total
+    end
+    return current .. "/" .. shown_total
+end
+
+local function load_queue(queue)
+    if #queue == 0 or not item_url(queue[1].value) then return false end
+    if not mp.commandv("loadfile", queue[1].value[2], "replace") then return false end
+    for index = 2, #queue do
+        mp.commandv("loadfile", queue[index].value[2], "append")
+    end
+    for index, item in ipairs(queue) do
+        mp.set_property("playlist/" .. (index - 1) .. "/title", item.title)
+    end
+    if #queue > 1 then mp.osd_message("Queued " .. (#queue - 1) .. " more", 2) end
+    return true
+end
+
+-- Starts at the clicked video and appends every later video that was not skipped.
+local function play_queued(value, items)
+    local stream_url = item_url(value)
+    if not opts.queue_episodes or not stream_url then
+        return type(value) == "table" and mp.commandv(unpack(value))
+    end
+    local videos = video_items(items)
+    local start_index
+    for index, item in ipairs(videos) do
+        if item_url(item.value) == stream_url then start_index = index break end
+    end
+    if not start_index or #videos < 2 then
+        return mp.commandv(unpack(value))
+    end
+    local skipped = episode_skips[stream_hash(stream_url)] or {}
+    local queue = {videos[start_index]}
+    for index = start_index + 1, #videos do
+        if not skipped[item_url(videos[index].value)] then queue[#queue + 1] = videos[index] end
+    end
+    return load_queue(queue)
+end
+
+local function play_picked(items)
+    local hash = items_hash(items)
+    local picks = hash and episode_picks[hash]
+    if not picks or #picks == 0 then return false end
+    local by_url = {}
+    for _, item in ipairs(video_items(items)) do by_url[item_url(item.value)] = item end
+    local queue = {}
+    for _, url in ipairs(picks) do
+        if by_url[url] then queue[#queue + 1] = by_url[url] end
+    end
+    return load_queue(queue)
+end
+
+local function toggle_episode_skip(value)
+    local url = item_url(value)
+    local hash = stream_hash(url)
+    if not hash then return end
+    local skipped = episode_skips[hash] or {}
+    skipped[url] = not skipped[url] or nil
+    episode_skips[hash] = skipped
+end
+
+local function toggle_episode_pick(value)
+    local url = item_url(value)
+    local hash = stream_hash(url)
+    if not hash then return end
+    local picks = episode_picks[hash] or {}
+    local index = pick_index(hash, url)
+    if index then table.remove(picks, index) else picks[#picks + 1] = url end
+    episode_picks[hash] = picks
+end
+
+local function clear_marks(store, items)
+    local hash = items_hash(items)
+    if hash then store[hash] = nil end
+end
+
 local function is_playing_file(item)
-    if not playing.hash or type(item.value) ~= "table" then return false end
-    local url = item.value[2]
-    if type(url) ~= "string" then return false end
-    local h = url:match("[?&]link=([^&]+)")
-    if not h or h:lower() ~= playing.hash then return false end
+    local url = item_url(item.value)
+    if not playing.hash or stream_hash(url) ~= playing.hash then return false end
     if not playing.index then return true end
-    local i = url:match("[?&]index=([^&]+)")
-    return i == playing.index
+    return url:match("[?&]index=([^&]+)") == playing.index
 end
 
 local function show_files(items, back)
@@ -441,18 +613,75 @@ local function show_files(items, back)
     menu_view = "files"
     clear_search()
     local menu_items = {back_item(files_back)}
+    local videos = video_items(items)
+    local hash = items_hash(items)
+    local picks = hash and episode_picks[hash] or {}
+    local skipped = hash and episode_skips[hash] or {}
+    local skip_count = 0
+    for _ in pairs(skipped) do skip_count = skip_count + 1 end
+    local queueable = opts.queue_episodes and #videos > 1
+    if queueable and #picks > 0 then
+        menu_items[#menu_items + 1] = {
+            title = "Play playlist (" .. #picks .. ")",
+            hint = "in the order added",
+            icon = "playlist_play",
+            value = "play_picks",
+            keep_open = true,
+            actions = {{name = "clear_picks", icon = "close", label = "Clear playlist"}},
+        }
+    end
+    if queueable and skip_count > 0 then
+        menu_items[#menu_items + 1] = {
+            title = "Include skipped (" .. skip_count .. ")",
+            icon = "playlist_add",
+            value = "clear_skips",
+            keep_open = true,
+            separator = true,
+        }
+    end
     for _, item in ipairs(items) do
+        local url = item_url(item.value)
+        local video = is_video_file(item.title)
+        local skipped_file = video and skipped[url]
+        local added = video and pick_index(hash, url)
+        local hint = item.hint
+        if added then hint = "#" .. added .. (hint and (" · " .. hint) or "") end
+        local actions
+        if video and queueable then
+            actions = {
+                {
+                    name = "toggle_skip",
+                    icon = skipped_file and "add" or "remove",
+                    label = skipped_file and "Include" or "Skip",
+                },
+                {
+                    name = "toggle_pick",
+                    icon = added and "close" or "playlist_add",
+                    label = added and "Remove from playlist" or "Add to playlist",
+                },
+            }
+        end
         menu_items[#menu_items + 1] = {
             title = elide(item.title, opts.title_max_chars),
-            hint = item.hint,
-            icon = is_playing_file(item) and "play_arrow" or "movie",
+            hint = hint,
+            icon = is_playing_file(item) and "play_arrow" or (skipped_file and "visibility_off" or (video and "movie" or "description")),
             value = item.value,
+            actions = actions,
         }
     end
     if #menu_items == 1 then
         menu_items[#menu_items + 1] = {title = "No files returned by TorrServer", selectable = false}
     end
-    send_menu("update-menu", menu_data("Files", menu_items))
+    local footnote
+    if queueable then
+        footnote = (episode_progress_label(items, hash) or (#videos .. " episodes"))
+            .. " · click plays it and queues the rest · Skip excludes · Add to playlist builds your own"
+    end
+    send_menu("update-menu", menu_data("Files", menu_items, footnote))
+end
+
+local function refresh_files()
+    if files_items then show_files(files_items) end
 end
 
 --- search -----------------------------------------------------------
@@ -1185,7 +1414,9 @@ local function play_history_entry(hash)
         return
     end
     if not start_torrserver() then return end
-    if not mp.commandv(unpack(entry.items[1].value)) then
+    local videos = video_items(entry.items)
+    local value = (videos[1] or entry.items[1]).value
+    if not play_queued(value, entry.items) then
         show_error("failed to start playback")
     end
 end
@@ -1290,9 +1521,8 @@ end
 -- Playing state reflects what's actually loaded in mpv, not TorrServer's
 -- download activity (which can stay nonzero briefly after a stream is dropped).
 mp.observe_property("path", "string", function(_, path)
-    local hash = path and path:match("[?&]link=([^&]+)")
+    local hash = stream_hash(path)
     local index = path and path:match("[?&]index=([^&]+)")
-    if hash then hash = hash:lower() end
     if hash ~= playing.hash or index ~= playing.index then
         playing.hash = hash
         playing.index = index
@@ -1398,6 +1628,11 @@ mp.register_script_message("torrserver-menu-event", function(json)
         end
         return
     end
+    if event.action == "clear_picks" then
+        clear_marks(episode_picks, files_items)
+        refresh_files()
+        return
+    end
     if event.action == "copy_magnet" then
         -- Search results only: event.value is the magnet URI itself here,
         -- unlike history items (see history_hash usage above).
@@ -1408,11 +1643,30 @@ mp.register_script_message("torrserver-menu-event", function(json)
         return
     end
     if type(event.value) == "table" then
-        if mp.commandv(unpack(event.value)) then
+        if event.action == "toggle_skip" then
+            toggle_episode_skip(event.value)
+            refresh_files()
+            return
+        end
+        if event.action == "toggle_pick" then
+            toggle_episode_pick(event.value)
+            refresh_files()
+            return
+        end
+        if play_queued(event.value, files_items) then
             commit_pending()
         else
             show_error("failed to start playback")
         end
+    elseif event.value == "play_picks" then
+        if play_picked(files_items) then
+            commit_pending()
+        else
+            show_error("playlist is empty")
+        end
+    elseif event.value == "clear_skips" then
+        clear_marks(episode_skips, files_items)
+        refresh_files()
     elseif event.value == "add_magnet" then
         add_magnet(read_clipboard())
     elseif event.value == "open_torrserver" then
@@ -1471,6 +1725,26 @@ mp.add_key_binding(nil, "torrserver", function()
 end)
 
 mp.register_event("shutdown", stop_torrserver)
+
+-- playlist_autoplay=no: mpv would still advance on its own, so remember an
+-- eof that still has a later entry and pause the file that replaces it.
+local pause_next_queued_file = false
+
+mp.register_event("end-file", function(event)
+    if opts.playlist_autoplay or event.reason ~= "eof" or not playing.hash then return end
+    local count = mp.get_property_number("playlist-count") or 0
+    local position = mp.get_property_number("playlist-pos") or -1
+    if position >= 0 and position + 1 < count then
+        pause_next_queued_file = true
+    end
+end)
+
+mp.register_event("file-loaded", function()
+    if not pause_next_queued_file then return end
+    pause_next_queued_file = false
+    mp.set_property_bool("pause", true)
+    mp.osd_message("TorrServer: next episode paused", 2)
+end)
 
 -- Runs once per mpv start/script reload; TTL-cached (see opts.update_check_interval)
 -- so this only hits the binary/release API once a day, never on menu open.
